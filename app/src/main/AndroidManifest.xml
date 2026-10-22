@@ -10,6 +10,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <!-- Android 11+ hides other apps unless they are declared: Shizuku (to open it) and Dolphin. -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="org.dolphinemu.dolphinemu" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <application android:name=".App" android:label="Wii Remote Bridge" android:icon="@drawable/ic_launcher"

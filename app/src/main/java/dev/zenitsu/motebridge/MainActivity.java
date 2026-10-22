@@ -164,7 +164,8 @@ public class MainActivity extends Activity {
                 shizuku.set("Connecting…", WARN, null, null);
                 break;
             case READY:
-                shizuku.set("Ready", OK, null, null);
+                shizuku.set("Ready. After a restart, open Shizuku and tap Start: the bridge and Dolphin follow by themselves.",
+                        OK, "Open Shizuku", this::openShizuku);
                 break;
         }
         IShell s = Shell.get();
