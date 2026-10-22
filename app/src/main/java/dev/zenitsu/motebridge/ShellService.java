@@ -45,7 +45,8 @@ public class ShellService extends IShell.Stub {
 
     @Override public synchronized boolean startBridge(String executable) {
         stopBridge();
-        exec("pkill -f " + COPY + "; pkill -x wiibridge");   // also an older hand-started bridge
+        // An earlier copy (or an older hand-started bridge) would hold the remote's devices.
+        exec("for p in $(pidof motebridge-wiibridge wiibridge); do kill $p; done");
         // Executables in the app's install directory are not runnable by the shell user; run a copy.
         exec("cp '" + executable + "' " + COPY + " && chmod 755 " + COPY);
         // Retroid handhelds replace every new controller with a copy of their own pad (fixed axes, no
