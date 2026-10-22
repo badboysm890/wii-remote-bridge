@@ -1,19 +1,31 @@
 // wiibridge: real Wii Remotes as Android game controllers, without root. Up to four players.
 //
 // The kernel's hid-wiimote driver splits each remote into several input devices (buttons, IR camera,
-// accelerometer, Nunchuk). Android only adopts the one with buttons, so apps such as Dolphin never see
-// the pointer or the motion. This program (run as the adb/Shizuku shell user, which may read
-// /dev/input and write /dev/uinput) groups each remote's parts by its Bluetooth address and re-emits
-// them as one virtual gamepad per remote, "Wii Remote 1" to "Wii Remote 4":
+// accelerometer, extensions, MotionPlus). Android only adopts the one with buttons, so apps such as
+// Dolphin never see the pointer or the motion. This program (run as the adb/Shizuku shell user, which may
+// read /dev/input and write /dev/uinput) groups each remote's parts by its Bluetooth address and re-emits
+// them as one virtual gamepad per remote, "Wii Remote 1" to "Wii Remote 4".
 //
-//   buttons   A=SOUTH B=EAST 1=WEST 2=NORTH  +=START -=SELECT Home=MODE  D-pad=arrow keys (Android drops
-//             BTN_DPAD_*)  C=TL Z=TR
-//   ABS_X/Y   Nunchuk stick                     ABS_RX/RY  IR pointer (sensor bar)
-//   ABS_Z/RZ/THROTTLE  remote acceleration x/y/z (+-1 = 4 g)   ABS_RUDDER/WHEEL/GAS  Nunchuk acceleration
-//   THUMBL/THUMBR      remote / Nunchuk shake
+// Android scales two kinds of axes differently: "centred" ones (X Y Z RX RY RZ RUDDER WHEEL) report -1..1,
+// all others 0..1 (Dolphin then only offers their + direction). Signed data on a 0..1 axis is sent as
+// (v + 1) / 2 and decoded in Dolphin's mapping as `Axis n+` * 2 - 1. The layout (Android axis numbers):
+//
+//   X Y (0 1)              extension stick: Nunchuk, or the Classic Controller's left stick
+//   RX RY (12 13)          pointer: middle of the sensor bar's dots, -1..1, flipped like the screen
+//   Z RZ RUDDER (11 14 20) remote acceleration x y z, +-1 = 4 g
+//   WHEEL (21), 0x2b (41)  Classic right stick x, y (signed)
+//   THROTTLE GAS BRAKE (19 22 23)  Nunchuk acceleration x y z (signed, 0..1 encoded)
+//   HAT1X..HAT3Y (32..37)  raw IR camera dots 1 and 2: x, y, size (0..1; size 0 = not seen)
+//   MISC 0x29 0x2a (38 39 40)      MotionPlus angular velocity x y z (signed, +-1 = 2000 deg/s)
+//   0x2c 0x2d (42 43)      Classic L and R analog triggers (0..1)
+//
+//   buttons: remote A=SOUTH B=EAST 1=WEST 2=NORTH +=START -=SELECT Home=MODE D-pad=arrow keys
+//            Nunchuk C=TL Z=TR; shake: remote THUMBL, Nunchuk THUMBR
+//            Classic A B X Y ZL ZR L R + - Home Up Down Left Right = BTN_0..BTN_0+14 (Android BUTTON_1..15)
 //
 // Rumble from Android (each controller's vibrator, e.g. Dolphin) goes back to the matching remote.
-// A remote keeps its player number for as long as the bridge runs, also across reconnects.
+// A remote keeps its player number for as long as the bridge runs, also across reconnects. The attached
+// extension of every player is written to STATUS_FILE so the app can tell Dolphin.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -28,10 +40,21 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { KEYS, IR, ACCEL, NUNCHUK, NPART };
+enum { KEYS, IR, ACCEL, NUNCHUK, CLASSIC, MPLUS, NPART };
 static const char *PART_NAMES[NPART] = {
     "Nintendo Wii Remote", "Nintendo Wii Remote IR", "Nintendo Wii Remote Accelerometer",
-    "Nintendo Wii Remote Nunchuk"};
+    "Nintendo Wii Remote Nunchuk", "Nintendo Wii Remote Classic Controller", "Nintendo Wii Remote Motion Plus"};
+#define STATUS_FILE "/data/local/tmp/wiibridge.status"
+
+// Axes beyond Android's named ones (it numbers them AXIS_GENERIC_1.. in code order).
+#define ABS_GYRO_X ABS_MISC
+#define ABS_GYRO_Y (ABS_MISC + 1)
+#define ABS_GYRO_Z (ABS_MISC + 2)
+#define ABS_CC_RY (ABS_MISC + 3)
+#define ABS_CC_LT (ABS_MISC + 4)
+#define ABS_CC_RT (ABS_MISC + 5)
+#define GYRO_SCALE 167.56   // hid-wiimote MotionPlus units per degree/second
+#define GYRO_RANGE 2000.0   // degrees/second at full axis
 
 #define MAX_REMOTES 4
 #define AXMAX 32767
@@ -50,9 +73,26 @@ typedef struct {
     int have_sep;
     int acc[2][3];           // latest raw acceleration: remote, Nunchuk
     int shaking[2];
+    struct input_absinfo cc[6];   // Classic Controller stick and trigger ranges (HAT1X..HAT3Y)
 } Remote;
 
 static Remote remotes[MAX_REMOTES];
+static int status_dirty = 1;
+
+/** "1 nunchuk mplus" per connected player, for the app (it sets Dolphin's extension to match). */
+static void write_status(void) {
+    status_dirty = 0;
+    FILE *f = fopen(STATUS_FILE ".tmp", "w");
+    if (!f) return;
+    for (int i = 0; i < MAX_REMOTES; i++) {
+        Remote *r = &remotes[i];
+        if (!r->used || r->fd[KEYS] < 0) continue;
+        fprintf(f, "%d %s%s\n", i + 1, r->fd[NUNCHUK] >= 0 ? "nunchuk" : r->fd[CLASSIC] >= 0 ? "classic" : "none",
+                r->fd[MPLUS] >= 0 ? " mplus" : "");
+    }
+    fclose(f);
+    rename(STATUS_FILE ".tmp", STATUS_FILE);
+}
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
@@ -64,6 +104,25 @@ static void emit(Remote *r, int type, int code, int value) {
 }
 
 static int clampi(double v) { return v > AXMAX ? AXMAX : v < -AXMAX ? -AXMAX : (int) v; }
+
+/** A signed value (-1..1) on a 0..1 axis: (v + 1) / 2. */
+static void emit_signed01(Remote *r, int code, double v) {
+    if (v > 1) v = 1;
+    if (v < -1) v = -1;
+    emit(r, EV_ABS, code, (int) ((v + 1) / 2 * AXMAX));
+}
+
+static void emit_unit(Remote *r, int code, double v) {
+    if (v > 1) v = 1;
+    if (v < 0) v = 0;
+    emit(r, EV_ABS, code, (int) (v * AXMAX));
+}
+
+/** -1..1 from a kernel axis range, centred on its middle. */
+static double norm(const struct input_absinfo *a, int v) {
+    double mid = (a->maximum + a->minimum) / 2.0, half = (a->maximum - a->minimum) / 2.0;
+    return half > 0 ? (v - mid) / half : 0;
+}
 
 /** Retroid handhelds replace every new controller with a copy of their own pad (fixed axes, no rumble)
  *  unless this setting is on while the controller is created. Returns whether it was switched on. */
@@ -90,13 +149,20 @@ static int make_controller(int slot) {
     int keys[] = {BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_START, BTN_SELECT, BTN_MODE, BTN_TL, BTN_TR,
                   KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, BTN_THUMBL, BTN_THUMBR};
     for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) ioctl(u, UI_SET_KEYBIT, keys[i]);
+    for (int k = BTN_0; k < BTN_0 + 15; k++) ioctl(u, UI_SET_KEYBIT, k);   // Classic Controller
     ioctl(u, UI_SET_EVBIT, EV_ABS);
-    int axes[] = {ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_THROTTLE, ABS_RUDDER, ABS_WHEEL, ABS_GAS};
-    for (unsigned i = 0; i < sizeof axes / sizeof *axes; i++) {
+    int centred[] = {ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_RUDDER, ABS_WHEEL};
+    int unit[] = {ABS_THROTTLE, ABS_GAS, ABS_BRAKE, ABS_HAT1X, ABS_HAT1Y, ABS_HAT2X, ABS_HAT2Y, ABS_HAT3X, ABS_HAT3Y,
+                  ABS_GYRO_X, ABS_GYRO_Y, ABS_GYRO_Z, ABS_CC_RY, ABS_CC_LT, ABS_CC_RT};
+    for (unsigned i = 0; i < sizeof centred / sizeof *centred + sizeof unit / sizeof *unit; i++) {
+        int is_centred = i < sizeof centred / sizeof *centred;
         struct uinput_abs_setup a;
         memset(&a, 0, sizeof a);
-        a.code = axes[i]; a.absinfo.minimum = -AXMAX; a.absinfo.maximum = AXMAX;
-        ioctl(u, UI_SET_ABSBIT, axes[i]);
+        a.code = is_centred ? centred[i] : unit[i - sizeof centred / sizeof *centred];
+        a.absinfo.minimum = is_centred ? -AXMAX : 0;
+        a.absinfo.maximum = AXMAX;
+        if (!is_centred) a.absinfo.value = a.code >= ABS_HAT1X && a.code <= ABS_HAT3Y ? 0 : AXMAX / 2;
+        ioctl(u, UI_SET_ABSBIT, a.code);
         ioctl(u, UI_ABS_SETUP, &a);
     }
     ioctl(u, UI_SET_EVBIT, EV_FF);
@@ -188,6 +254,27 @@ static int map_key(int code) {
     }
 }
 
+static int map_classic(int code) {
+    switch (code) {
+        case BTN_A: return BTN_0;
+        case BTN_B: return BTN_0 + 1;
+        case BTN_X: return BTN_0 + 2;
+        case BTN_Y: return BTN_0 + 3;
+        case BTN_TL2: return BTN_0 + 4;       // ZL
+        case BTN_TR2: return BTN_0 + 5;       // ZR
+        case BTN_TL: return BTN_0 + 6;        // L
+        case BTN_TR: return BTN_0 + 7;        // R
+        case KEY_NEXT: return BTN_0 + 8;      // +
+        case KEY_PREVIOUS: return BTN_0 + 9;  // -
+        case BTN_MODE: return BTN_0 + 10;     // Home
+        case KEY_UP: return BTN_0 + 11;
+        case KEY_DOWN: return BTN_0 + 12;
+        case KEY_LEFT: return BTN_0 + 13;
+        case KEY_RIGHT: return BTN_0 + 14;
+        default: return -1;
+    }
+}
+
 /** A shake (remote or Nunchuk) is a button: down past 2.2 g, up again below 1.4 g. */
 static void shake(Remote *r, int which) {
     double m = sqrt((double) r->acc[which][0] * r->acc[which][0] + (double) r->acc[which][1] * r->acc[which][1] +
@@ -203,11 +290,25 @@ static void release(Remote *r, int part) {
     static const int nunchuk_keys[] = {BTN_TL, BTN_TR, BTN_THUMBR};
     if (part == KEYS)
         for (unsigned i = 0; i < sizeof remote_keys / sizeof *remote_keys; i++) emit(r, EV_KEY, remote_keys[i], 0);
-    if (part == NUNCHUK) {
-        for (unsigned i = 0; i < sizeof nunchuk_keys / sizeof *nunchuk_keys; i++) emit(r, EV_KEY, nunchuk_keys[i], 0);
+    if (part == NUNCHUK || part == CLASSIC) {
+        if (part == NUNCHUK)
+            for (unsigned i = 0; i < sizeof nunchuk_keys / sizeof *nunchuk_keys; i++) emit(r, EV_KEY, nunchuk_keys[i], 0);
+        else
+            for (int k = BTN_0; k < BTN_0 + 15; k++) emit(r, EV_KEY, k, 0);
         emit(r, EV_ABS, ABS_X, 0);
         emit(r, EV_ABS, ABS_Y, 0);
+        emit(r, EV_ABS, ABS_WHEEL, 0);
+        emit_signed01(r, ABS_CC_RY, 0);
+        emit_unit(r, ABS_CC_LT, 0);
+        emit_unit(r, ABS_CC_RT, 0);
     }
+    if (part == MPLUS) {
+        emit_signed01(r, ABS_GYRO_X, 0);
+        emit_signed01(r, ABS_GYRO_Y, 0);
+        emit_signed01(r, ABS_GYRO_Z, 0);
+    }
+    if (part == IR)
+        for (int c = ABS_HAT1X; c <= ABS_HAT3Y; c++) emit(r, EV_ABS, c, 0);   // no dots: sensor bar not seen
     emit(r, EV_SYN, SYN_REPORT, 0);
 }
 
@@ -279,6 +380,9 @@ static void scan(void) {
         r->fd[part] = fd;
         snprintf(r->node[part], sizeof r->node[part], "%s", e->d_name);
         fprintf(stderr, "wiibridge: player %d (%s): %s connected\n", (int) (r - remotes) + 1, r->addr, name);
+        if (part == CLASSIC)
+            for (int a = 0; a < 6; a++) ioctl(fd, EVIOCGABS(ABS_HAT1X + a), &r->cc[a]);
+        status_dirty = 1;
         if (part == KEYS) {
             // Keep Android from also seeing the raw remote (it would be a second, button-only pad).
             ioctl(fd, EVIOCGRAB, 1);
@@ -294,28 +398,43 @@ static void read_part(Remote *r, int part, int *ir_moved, int *synced) {
     while (read(r->fd[part], &ev, sizeof ev) == sizeof ev) {
         if (ev.type == EV_SYN) { *synced = 1; if (part == IR) *ir_moved = 1; continue; }
         if (ev.type == EV_KEY && ev.value != 2) {
-            int k = map_key(ev.code);
+            int k = part == CLASSIC ? map_classic(ev.code) : map_key(ev.code);
             if (k >= 0) emit(r, EV_KEY, k, ev.value);
-        } else if (ev.type == EV_ABS && part == IR && ev.code >= ABS_HAT0X && ev.code <= ABS_HAT3Y) {
+        } else if (ev.type != EV_ABS) {
+            continue;
+        } else if (part == IR && ev.code >= ABS_HAT0X && ev.code <= ABS_HAT3Y) {
             int k = ev.code - ABS_HAT0X;
             r->dot[k / 2][k % 2] = ev.value;
-        } else if (ev.type == EV_ABS && part == ACCEL) {
+        } else if (part == ACCEL && ev.code >= ABS_RX && ev.code <= ABS_RZ) {
             int k = ev.code - ABS_RX;
-            if (k < 0 || k > 2) continue;
             r->acc[0][k] = ev.value;
-            int code = k == 0 ? ABS_Z : k == 1 ? ABS_RZ : ABS_THROTTLE;
+            int code = k == 0 ? ABS_Z : k == 1 ? ABS_RZ : ABS_RUDDER;
             emit(r, EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
             shake(r, 0);
-        } else if (ev.type == EV_ABS && part == NUNCHUK) {
+        } else if (part == NUNCHUK) {
             if (ev.code == ABS_HAT0X) emit(r, EV_ABS, ABS_X, clampi(ev.value * (AXMAX / 100.0)));
             else if (ev.code == ABS_HAT0Y) emit(r, EV_ABS, ABS_Y, clampi(-ev.value * (AXMAX / 100.0)));
             else if (ev.code >= ABS_RX && ev.code <= ABS_RZ) {
                 int k = ev.code - ABS_RX;
                 r->acc[1][k] = ev.value;
-                int code = k == 0 ? ABS_RUDDER : k == 1 ? ABS_WHEEL : ABS_GAS;
-                emit(r, EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
+                int code = k == 0 ? ABS_THROTTLE : k == 1 ? ABS_GAS : ABS_BRAKE;
+                emit_signed01(r, code, ev.value / (4 * G));
                 shake(r, 1);
             }
+        } else if (part == CLASSIC && ev.code >= ABS_HAT1X && ev.code <= ABS_HAT3Y) {
+            const struct input_absinfo *a = &r->cc[ev.code - ABS_HAT1X];
+            double v = norm(a, ev.value);
+            switch (ev.code) {
+                case ABS_HAT1X: emit(r, EV_ABS, ABS_X, clampi(v * AXMAX)); break;
+                case ABS_HAT1Y: emit(r, EV_ABS, ABS_Y, clampi(-v * AXMAX)); break;   // up is negative on Android
+                case ABS_HAT2X: emit(r, EV_ABS, ABS_WHEEL, clampi(v * AXMAX)); break;
+                case ABS_HAT2Y: emit_signed01(r, ABS_CC_RY, -v); break;
+                case ABS_HAT3X: emit_unit(r, ABS_CC_RT, (v + 1) / 2); break;   // R analog
+                case ABS_HAT3Y: emit_unit(r, ABS_CC_LT, (v + 1) / 2); break;   // L analog
+            }
+        } else if (part == MPLUS && ev.code >= ABS_RX && ev.code <= ABS_RZ) {
+            int code = ABS_GYRO_X + (ev.code - ABS_RX);
+            emit_signed01(r, code, ev.value / GYRO_SCALE / GYRO_RANGE);
         }
     }
 }
@@ -325,6 +444,17 @@ static void read_part(Remote *r, int part, int *ir_moved, int *synced) {
 static void update_pointer(Remote *r) {
     int idx[4], n = 0;
     for (int i = 0; i < 4; i++) if (r->dot[i][0] < 1023 && r->dot[i][1] < 1023) idx[n++] = i;
+    // The camera's own view for Dolphin's IR pass-through: the first two dots, in camera coordinates.
+    for (int j = 0; j < 2; j++) {
+        int base = ABS_HAT1X + j * 3;
+        if (j < n) {
+            emit_unit(r, base, r->dot[idx[j]][0] / 1023.0);
+            emit_unit(r, base + 1, r->dot[idx[j]][1] / 767.0);
+            emit_unit(r, base + 2, 0.3);   // basic IR mode reports no size; a mid-sized dot
+        } else {
+            emit(r, EV_ABS, base + 2, 0);   // size 0: not seen
+        }
+    }
     double cx = -1, cy = -1;
     if (n >= 2) {
         cx = (r->dot[idx[0]][0] + r->dot[idx[1]][0]) / 2.0;
@@ -351,6 +481,7 @@ int main(void) {
     double last_scan = -10;
     while (running) {
         if (now() - last_scan > 2) { last_scan = now(); scan(); }
+        if (status_dirty) write_status();
         struct pollfd p[MAX_REMOTES * (NPART + 1)];
         Remote *owner[MAX_REMOTES * (NPART + 1)];
         int part_of[MAX_REMOTES * (NPART + 1)];
@@ -379,6 +510,7 @@ int main(void) {
                     close(r->fd[k]); r->fd[k] = -1; r->node[k][0] = 0;
                     if (k == KEYS) r->rumble_id = -1;
                     release(r, k);
+                    status_dirty = 1;
                     continue;
                 }
                 read_part(r, k, &ir_moved, &synced);

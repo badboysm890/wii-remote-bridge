@@ -44,7 +44,7 @@ public class MainActivity extends Activity {
     private Step shizuku, remote, bridge, dolphin;
     private TestView test;
     private TextView pressed, log;
-    private CheckBox nunchuk, autostart;
+    private CheckBox autostart;
     private Pairing pairing;
     private final Set<String> held = new TreeSet<>();
     private final Runnable refresher = new Runnable() {
@@ -92,7 +92,8 @@ public class MainActivity extends Activity {
         TextView title = text("Wii Remote Bridge", 28, TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         root.addView(title);
-        TextView sub = text("A real Wii Remote in Dolphin: pointer, motion, Nunchuk and rumble. No DolphinBar, no root.", 15, DIM);
+        TextView sub = text("No DolphinBar needed. Pair your Wii Remotes here and this app sets up Dolphin for you: "
+                + "pointer, motion, Nunchuk, Classic Controller, rumble, up to 4 players. No root.", 15, DIM);
         sub.setPadding(0, dp(4), 0, dp(12));
         root.addView(sub);
 
@@ -105,13 +106,7 @@ public class MainActivity extends Activity {
         autostart.setChecked(prefs.getBoolean("autostart", true));
         autostart.setOnCheckedChangeListener((v, on) -> prefs.edit().putBoolean("autostart", on).apply());
         ((LinearLayout) bridge.action.getParent()).addView(autostart);
-        dolphin = new Step(root, "4", "Set up Dolphin");
-        nunchuk = new CheckBox(this);
-        nunchuk.setText("I play with the Nunchuk attached");
-        nunchuk.setTextColor(TEXT);
-        nunchuk.setChecked(prefs.getBoolean("nunchuk", true));
-        nunchuk.setOnCheckedChangeListener((v, on) -> prefs.edit().putBoolean("nunchuk", on).apply());
-        ((LinearLayout) dolphin.action.getParent()).addView(nunchuk);
+        dolphin = new Step(root, "4", "Dolphin (set up automatically)");
 
         LinearLayout testCard = card(root);
         TextView tt = text("Test", 20, TEXT);
@@ -182,13 +177,15 @@ public class MainActivity extends Activity {
             return;
         }
         Shell.async(sh -> {
-            String[] r = new String[5];
+            String[] r = new String[6];
             r[0] = sh.bridgeRunning() ? "1" : "0";
             r[1] = sh.run("ls /sys/bus/hid/drivers/ 2>/dev/null | grep -x wiimote; "
                     + "grep -l 'Nintendo Wii Remote' /sys/class/input/*/name 2>/dev/null | head -1; "
                     + "dmesg 2>/dev/null | grep -c 'wiimote.*failed with error -12'");
             r[2] = String.join(" ", Dolphin.packages(sh));
             r[3] = sh.bridgeLog();
+            r[5] = sh.extensions();
+            Dolphin.setUpIfNeeded(this, sh);
             r[4] = r[2].isEmpty() ? "" : sh.run("grep -A1 '^\\[Wiimote1\\]' " + Dolphin.configDir(r[2].split(" ")[0])
                     + "/WiimoteNew.ini 2>/dev/null | grep -o 'Android/[0-9]*/Wii Remote[ 0-9]*'");
             return r;
@@ -219,8 +216,7 @@ public class MainActivity extends Activity {
         InputDevice c = Dolphin.controller(this);
         java.util.List<InputDevice> pads = Dolphin.controllers(this);
         if (running && c != null) {
-            bridge.set(pads.size() == 1 ? "Running: player 1 is \"" + c.getName() + "\""
-                    : "Running: " + pads.size() + " players (" + names(pads) + ")", OK, "Restart", this::startBridge);
+            bridge.set("Running: " + attachments(r[5], pads.size()), OK, "Restart", this::startBridge);
         } else if (running) {
             bridge.set("Running, waiting for the Wii Remote", WARN, "Restart", this::startBridge);
         } else {
@@ -265,8 +261,7 @@ public class MainActivity extends Activity {
 
     private void setUpDolphin() {
         dolphin.set("Setting up…", WARN, null, null);
-        boolean withNunchuk = nunchuk.isChecked();
-        Shell.async(sh -> Dolphin.setUp(this, sh, withNunchuk), msg -> {
+        Shell.async(sh -> Dolphin.setUp(this, sh), msg -> {
             dolphin.status.setText(msg == null ? "Failed" : msg);
             handler.postDelayed(this::refresh, 1500);
         });
@@ -294,6 +289,19 @@ public class MainActivity extends Activity {
             Vibrator v = pads.get(i).getVibratorManager().getDefaultVibrator();
             handler.postDelayed(() -> v.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE)), i * 600L);
         }
+    }
+
+    /** "player 1: Wii Remote + Nunchuk + MotionPlus" per line, from the bridge's status. */
+    private static String attachments(String status, int pads) {
+        StringBuilder b = new StringBuilder();
+        for (String line : status.trim().split("\n")) {
+            String[] f = line.trim().split("\\s+");
+            if (f.length < 2) continue;
+            b.append(b.length() == 0 ? "" : "\n").append("player ").append(f[0]).append(": Wii Remote")
+             .append(f[1].equals("nunchuk") ? " + Nunchuk" : f[1].equals("classic") ? " + Classic Controller" : "")
+             .append(line.contains("mplus") ? " + MotionPlus" : "");
+        }
+        return b.length() == 0 ? pads + " controller(s), waiting for the Wii Remote" : b.toString();
     }
 
     private static String names(java.util.List<InputDevice> pads) {
@@ -355,6 +363,21 @@ public class MainActivity extends Activity {
             case KeyEvent.KEYCODE_BUTTON_R1: return "Z";
             case KeyEvent.KEYCODE_BUTTON_THUMBL: return "Shake";
             case KeyEvent.KEYCODE_BUTTON_THUMBR: return "Nunchuk-shake";
+            case KeyEvent.KEYCODE_BUTTON_1: return "CC-A";
+            case KeyEvent.KEYCODE_BUTTON_2: return "CC-B";
+            case KeyEvent.KEYCODE_BUTTON_3: return "CC-X";
+            case KeyEvent.KEYCODE_BUTTON_4: return "CC-Y";
+            case KeyEvent.KEYCODE_BUTTON_5: return "CC-ZL";
+            case KeyEvent.KEYCODE_BUTTON_6: return "CC-ZR";
+            case KeyEvent.KEYCODE_BUTTON_7: return "CC-L";
+            case KeyEvent.KEYCODE_BUTTON_8: return "CC-R";
+            case KeyEvent.KEYCODE_BUTTON_9: return "CC-+";
+            case KeyEvent.KEYCODE_BUTTON_10: return "CC-−";
+            case KeyEvent.KEYCODE_BUTTON_11: return "CC-Home";
+            case KeyEvent.KEYCODE_BUTTON_12: return "CC-↑";
+            case KeyEvent.KEYCODE_BUTTON_13: return "CC-↓";
+            case KeyEvent.KEYCODE_BUTTON_14: return "CC-←";
+            case KeyEvent.KEYCODE_BUTTON_15: return "CC-→";
             default: return KeyEvent.keyCodeToString(key).replace("KEYCODE_", "");
         }
     }
@@ -372,8 +395,8 @@ public class MainActivity extends Activity {
             if (nx != px || ny != py) irAt = System.currentTimeMillis();
             px = nx; py = ny;
             ax = e.getAxisValue(MotionEvent.AXIS_Z) * 4; ay = e.getAxisValue(MotionEvent.AXIS_RZ) * 4;
-            az = e.getAxisValue(MotionEvent.AXIS_THROTTLE) * 4;
-            sx = e.getAxisValue(MotionEvent.AXIS_X); sy = e.getAxisValue(MotionEvent.AXIS_Y);
+            az = e.getAxisValue(MotionEvent.AXIS_RUDDER) * 4;
+            sx = e.getAxisValue(MotionEvent.AXIS_X); sy = e.getAxisValue(MotionEvent.AXIS_Y);   // Nunchuk / Classic left stick
             seen = true;
             invalidate();
         }
@@ -397,7 +420,7 @@ public class MainActivity extends Activity {
             bar(c, bx, dp(30), bw, "Tilt X", ax);
             bar(c, bx, dp(80), bw, "Tilt Y", ay);
             bar(c, bx, dp(130), bw, "Up/down", az);
-            p.setColor(DIM); c.drawText("Nunchuk", bx, dp(190), p);
+            p.setColor(DIM); c.drawText("Nunchuk / Classic stick", bx, dp(190), p);
             p.setStyle(Paint.Style.STROKE); p.setColor(0xFF30363D);
             float cx = bx + dp(36), cy = dp(226), r = dp(28);
             c.drawCircle(cx, cy, r, p);

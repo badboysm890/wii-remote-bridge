@@ -86,6 +86,7 @@ final class Shell {
                 Thread.sleep(1500);
                 Dolphin.refreshDevice(app, s);
             }
+            Dolphin.setUpIfNeeded(app, s);
             return true;
         }, ok -> changed());
     }

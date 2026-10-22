@@ -37,6 +37,7 @@ public class AutoStartService extends Service {
                 if (!sh.bridgeRunning()) sh.startBridge(Shell.bridgeExecutable(this));
                 Thread.sleep(1500);
                 Dolphin.refreshDevice(this, sh);
+                Dolphin.setUpIfNeeded(this, sh);
                 return true;
             }, ok -> stopSelf());
             return;

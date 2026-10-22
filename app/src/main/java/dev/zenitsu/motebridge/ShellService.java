@@ -13,6 +13,8 @@ import java.util.ArrayDeque;
 public class ShellService extends IShell.Stub {
     private static final String COPY = "/data/local/tmp/motebridge-wiibridge";
     private static final String RETROID = "no_create_gamepad_button_layout";
+    private static final String STATUS = "/data/local/tmp/wiibridge.status";
+    private String lastExtensions = "";
 
     private Process bridge;
     private String wanted;          // executable to keep running, null when stopped on purpose
@@ -30,6 +32,7 @@ public class ShellService extends IShell.Stub {
                     append("bridge exited; restarting");
                     startBridge(exe);
                 }
+                followExtensions();
             }
         }, "watchdog");
         w.setDaemon(true);
@@ -110,6 +113,26 @@ public class ShellService extends IShell.Stub {
         }
     }
 
+    /**
+     * A Nunchuk or Classic Controller was plugged in or out: set that player's extension in every Dolphin we
+     * set up, so the next game sees what is really attached.
+     */
+    private void followExtensions() {
+        String now = extensions().trim();
+        if (now.equals(lastExtensions)) return;
+        lastExtensions = now;
+        for (String line : now.split("\n")) {
+            String[] f = line.trim().split("\\s+");
+            if (f.length < 2 || !f[0].matches("[1-4]")) continue;
+            String ext = f[1].equals("nunchuk") ? "Nunchuk" : f[1].equals("classic") ? "Classic" : "None";
+            String section = "/^\\[Wiimote" + f[0] + "\\]/,/^\\[/";
+            exec("for f in /sdcard/Android/data/org.dolphinemu*/files/Config/WiimoteNew.ini; do "
+                    + "grep -q '/Wii Remote " + f[0] + "$' \"$f\" && sed -i '" + section + "s/^Extension = .*/Extension = " + ext
+                    + "/' \"$f\"; done");
+            append("player " + f[0] + ": " + ext + (line.contains("mplus") ? " + MotionPlus" : ""));
+        }
+    }
+
     private synchronized void append(String line) {
         log.add(line);
         while (log.size() > 40) log.poll();
@@ -118,6 +141,23 @@ public class ShellService extends IShell.Stub {
     @Override public synchronized void stopBridge() {
         wanted = null;
         if (bridge != null) { bridge.destroy(); bridge = null; }
+    }
+
+    @Override public String axisMap(String deviceName) {
+        String input = exec("dumpsys input");
+        java.util.regex.Matcher d = java.util.regex.Pattern.compile("\n  Device -?\\d+: " + java.util.regex.Pattern.quote(deviceName) + "\n").matcher(input);
+        if (!d.find()) return "";
+        int end = input.indexOf("\n  Device ", d.end());
+        String dev = input.substring(d.end(), end < 0 ? input.length() : end);
+        // Joystick Input Mapper: "GENERIC_3: min=..." then "rawAxis=22, ..." a line later.
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("GENERIC_(\\d+): min=[^\n]*\n[^\n]*\n\\s*rawAxis=(\\d+)").matcher(dev);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) out.append(out.length() == 0 ? "" : ",").append(m.group(2)).append('=').append(m.group(1));
+        return out.toString();
+    }
+
+    @Override public String extensions() {
+        return exec("cat " + STATUS + " 2>/dev/null");
     }
 
     @Override public synchronized boolean bridgeRunning() {
