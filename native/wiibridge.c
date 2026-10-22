@@ -33,6 +33,7 @@
 #include <linux/uinput.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +79,16 @@ typedef struct {
 
 static Remote remotes[MAX_REMOTES];
 static int status_dirty = 1;
+
+// Pointer: outside games, player 1's sensor-bar pointing drives an Android mouse pointer (hover selects in
+// launchers), and B clicks while pointing. Inside Dolphin it is off, so it cannot touch the game.
+#define PMAX 32767
+static int pointer_u = -1;
+static volatile int pointer_on = 0;
+static double pointer_seen;     // last time player 1 pointed at the sensor bar
+static int screen_w = 1920, screen_h = 1080;
+static double aim_x = -1, aim_y = -1, carry_x, carry_y;   // last aim in screen pixels, sub-pixel rest
+static int b_as_click;          // the B press in progress went to the pointer (so its release does too)
 
 /** "1 nunchuk mplus" per connected player, for the app (it sets Dolphin's extension to match). */
 static void write_status(void) {
@@ -138,6 +149,44 @@ static void retroid_cloning_back(int was_switched) {
     if (!was_switched) return;
     sleep(2);   // Retroid's mapping service reacts to the new device after it appears
     if (system("settings put system no_create_gamepad_button_layout 0") != 0) { }
+}
+
+/** A relative mouse: stock Android only shows a pointer for those (absolute ones are ignored). */
+static int make_pointer(void) {
+    int u = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (u < 0) return -1;
+    ioctl(u, UI_SET_EVBIT, EV_KEY);
+    ioctl(u, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(u, UI_SET_KEYBIT, BTN_RIGHT);
+    ioctl(u, UI_SET_EVBIT, EV_REL);
+    ioctl(u, UI_SET_RELBIT, REL_X);
+    ioctl(u, UI_SET_RELBIT, REL_Y);
+    struct uinput_setup st;
+    memset(&st, 0, sizeof st);
+    snprintf(st.name, sizeof st.name, "Wii Remote Pointer");
+    st.id.bustype = BUS_VIRTUAL; st.id.vendor = 0x057e; st.id.product = 0x7f01;
+    if (ioctl(u, UI_DEV_SETUP, &st) < 0 || ioctl(u, UI_DEV_CREATE) < 0) { close(u); return -1; }
+    return u;
+}
+
+static void pointer_emit(int type, int code, int value) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = type; ev.code = code; ev.value = value;
+    if (pointer_u >= 0 && write(pointer_u, &ev, sizeof ev) < 0) { }
+}
+
+/** Whether a game (Dolphin) is in front; checked off the input path, every 1.5 s. */
+static void *focus_watch(void *unused) {
+    (void) unused;
+    for (;;) {
+        FILE *f = popen("dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp'", "r");
+        char line[512] = "";
+        if (f) { if (!fgets(line, sizeof line, f)) line[0] = 0; pclose(f); }
+        pointer_on = line[0] && !strstr(line, "org.dolphinemu");
+        usleep(1500000);
+    }
+    return NULL;
 }
 
 /** The virtual controller for player slot+1. UI_DEV_SETUP, not the legacy uinput_user_dev write:
@@ -398,6 +447,16 @@ static void read_part(Remote *r, int part, int *ir_moved, int *synced) {
     while (read(r->fd[part], &ev, sizeof ev) == sizeof ev) {
         if (ev.type == EV_SYN) { *synced = 1; if (part == IR) *ir_moved = 1; continue; }
         if (ev.type == EV_KEY && ev.value != 2) {
+            if (part == KEYS && ev.code == BTN_B && r == &remotes[0]) {
+                // Pointing at the screen outside a game: B clicks. Otherwise B is the controller's B (Back).
+                if (ev.value == 1) b_as_click = pointer_on && pointer_u >= 0 && now() - pointer_seen < 1.0;
+                if (b_as_click) {
+                    pointer_emit(EV_KEY, BTN_LEFT, ev.value);
+                    pointer_emit(EV_SYN, SYN_REPORT, 0);
+                    if (ev.value == 1) rumble(r, 1, 30);
+                    continue;
+                }
+            }
             int k = part == CLASSIC ? map_classic(ev.code) : map_key(ev.code);
             if (k >= 0) emit(r, EV_KEY, k, ev.value);
         } else if (ev.type != EV_ABS) {
@@ -470,6 +529,27 @@ static void update_pointer(Remote *r) {
     r->px += (x - r->px) * 0.5; r->py += (y - r->py) * 0.5;
     emit(r, EV_ABS, ABS_RX, clampi(r->px * AXMAX));
     emit(r, EV_ABS, ABS_RY, clampi(r->py * AXMAX));
+    if (r == &remotes[0]) {
+        if (pointer_on) {
+            // The camera's edges are hard to reach; use its middle 64% for the whole screen.
+            double sx = (r->px * 0.5 + 0.5 - 0.18) / 0.64, sy = (r->py * 0.5 + 0.5 - 0.18) / 0.64;
+            if (sx < 0) sx = 0; if (sx > 1) sx = 1; if (sy < 0) sy = 0; if (sy > 1) sy = 1;
+            double tx = sx * screen_w, ty = sy * screen_h;
+            if (aim_x >= 0 && now() - pointer_seen < 0.5) {
+                // Move by how far the aim moved; a long gap (bar out of view) restarts from here.
+                double dx = tx - aim_x + carry_x, dy = ty - aim_y + carry_y;
+                int ix = (int) dx, iy = (int) dy;
+                carry_x = dx - ix; carry_y = dy - iy;
+                if (ix || iy) {
+                    pointer_emit(EV_REL, REL_X, ix);
+                    pointer_emit(EV_REL, REL_Y, iy);
+                    pointer_emit(EV_SYN, SYN_REPORT, 0);
+                }
+            }
+            aim_x = tx; aim_y = ty;
+        }
+        pointer_seen = now();
+    }
 }
 
 static volatile int running = 1;
@@ -478,6 +558,18 @@ static void quit(int s) { (void) s; running = 0; }
 int main(void) {
     signal(SIGTERM, quit); signal(SIGINT, quit); signal(SIGHUP, SIG_IGN);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    {
+        FILE *f = popen("wm size 2>/dev/null | tail -1", "r");
+        char line[96] = "";
+        if (f) { if (fgets(line, sizeof line, f)) { char *p = strrchr(line, ' '); int w, h;
+            if (p && sscanf(p + 1, "%dx%d", &w, &h) == 2) { screen_w = w > h ? w : h; screen_h = w > h ? h : w; } } pclose(f); }
+        int retroid = retroid_cloning_off();
+        pointer_u = make_pointer();
+        retroid_cloning_back(retroid);
+        pthread_t t;
+        pthread_create(&t, NULL, focus_watch, NULL);
+        pthread_detach(t);
+    }
     double last_scan = -10;
     while (running) {
         if (now() - last_scan > 2) { last_scan = now(); scan(); }
@@ -525,5 +617,6 @@ int main(void) {
         if (r->fd[KEYS] >= 0) ioctl(r->fd[KEYS], EVIOCGRAB, 0);
         if (r->u >= 0) ioctl(r->u, UI_DEV_DESTROY);
     }
+    if (pointer_u >= 0) ioctl(pointer_u, UI_DEV_DESTROY);
     return 0;
 }
