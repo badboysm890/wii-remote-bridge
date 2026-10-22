@@ -173,11 +173,27 @@ static void shake(int which) {
     if (now_on != shaking[which]) { shaking[which] = now_on; emit(EV_KEY, which ? BTN_THUMBR : BTN_THUMBL, now_on); }
 }
 
+/** The remote (or its Nunchuk) went away: let go of everything it was holding, so nothing sticks. */
+static void release(int part) {
+    static const int remote_keys[] = {BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_START, BTN_SELECT, BTN_MODE,
+                                      KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, BTN_THUMBL};
+    static const int nunchuk_keys[] = {BTN_TL, BTN_TR, BTN_THUMBR};
+    if (part == KEYS)
+        for (unsigned i = 0; i < sizeof remote_keys / sizeof *remote_keys; i++) emit(EV_KEY, remote_keys[i], 0);
+    if (part == NUNCHUK) {
+        for (unsigned i = 0; i < sizeof nunchuk_keys / sizeof *nunchuk_keys; i++) emit(EV_KEY, nunchuk_keys[i], 0);
+        emit(EV_ABS, ABS_X, 0);
+        emit(EV_ABS, ABS_Y, 0);
+    }
+    emit(EV_SYN, SYN_REPORT, 0);
+}
+
 static volatile int running = 1;
 static void quit(int s) { (void) s; running = 0; }
 
 int main(void) {
     signal(SIGTERM, quit); signal(SIGINT, quit); signal(SIGHUP, SIG_IGN);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     make_controller();
     int dot[4][2];
     for (int i = 0; i < 4; i++) dot[i][0] = dot[i][1] = 1023;
@@ -204,6 +220,7 @@ int main(void) {
             if (p[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 fprintf(stderr, "wiibridge: %s gone\n", NAMES[i]);
                 close(fds[i]); fds[i] = -1;
+                release(i);
                 if (i == KEYS) rumble_id = -1;
                 continue;
             }

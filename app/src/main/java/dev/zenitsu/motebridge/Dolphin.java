@@ -85,9 +85,10 @@ final class Dolphin {
     }
 
     // Axis numbers are Android's MotionEvent axes: X 0, Y 1, Z 11, RX 12, RY 13, RZ 14, THROTTLE 19,
-    // RUDDER 20, WHEEL 21, GAS 22. Acceleration axes carry +-4 g.
+    // RUDDER 20, WHEEL 21, GAS 22. Acceleration axes carry +-4 g; Dolphin's accelerometer input wants
+    // m/s^2 (it rests at 9.8), so each is scaled by 4 g = 39.2266 m/s^2. Its y is Backward - Forward.
     static String section(String device, boolean nunchuk) {
-        String acc = "`Axis %d%s` * 4";
+        String acc = "`Axis %d%s` * 39.2266";
         StringBuilder s = new StringBuilder();
         s.append("[Wiimote1]\n")
          .append("Device = ").append(device).append('\n')
@@ -103,8 +104,8 @@ final class Dolphin {
          .append("IMUAccelerometer/Down = ").append(String.format(acc, 19, "-")).append('\n')
          .append("IMUAccelerometer/Left = ").append(String.format(acc, 11, "+")).append('\n')
          .append("IMUAccelerometer/Right = ").append(String.format(acc, 11, "-")).append('\n')
-         .append("IMUAccelerometer/Forward = ").append(String.format(acc, 14, "+")).append('\n')
-         .append("IMUAccelerometer/Backward = ").append(String.format(acc, 14, "-")).append('\n')
+         .append("IMUAccelerometer/Forward = ").append(String.format(acc, 14, "-")).append('\n')
+         .append("IMUAccelerometer/Backward = ").append(String.format(acc, 14, "+")).append('\n')
          .append("Rumble/Motor = `Motor 0`\n")
          .append("Nunchuk/Buttons/C = `Button L1`\nNunchuk/Buttons/Z = `Button R1`\n")
          .append("Nunchuk/Stick/Up = `Axis 1-`\nNunchuk/Stick/Down = `Axis 1+`\n")
@@ -114,8 +115,8 @@ final class Dolphin {
          .append("Nunchuk/IMUAccelerometer/Down = ").append(String.format(acc, 22, "-")).append('\n')
          .append("Nunchuk/IMUAccelerometer/Left = ").append(String.format(acc, 20, "+")).append('\n')
          .append("Nunchuk/IMUAccelerometer/Right = ").append(String.format(acc, 20, "-")).append('\n')
-         .append("Nunchuk/IMUAccelerometer/Forward = ").append(String.format(acc, 21, "+")).append('\n')
-         .append("Nunchuk/IMUAccelerometer/Backward = ").append(String.format(acc, 21, "-")).append('\n');
+         .append("Nunchuk/IMUAccelerometer/Forward = ").append(String.format(acc, 21, "-")).append('\n')
+         .append("Nunchuk/IMUAccelerometer/Backward = ").append(String.format(acc, 21, "+")).append('\n');
         return s.toString();
     }
 }

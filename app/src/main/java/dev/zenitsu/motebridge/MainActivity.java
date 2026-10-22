@@ -204,7 +204,10 @@ public class MainActivity extends Activity {
             remote.set("This device's system has no Wii Remote driver (hid-wiimote), so it cannot be used here.",
                     BAD, null, null);
         } else if (connected) {
-            remote.set("Connected", OK, "Pair again", this::pair);
+            int battery = remoteBattery();
+            remote.set(battery < 0 ? "Connected" : "Connected · battery " + battery + "%"
+                    + (battery <= 15 ? " (low: replace the batteries)" : ""), battery >= 0 && battery <= 15 ? WARN : OK,
+                    "Pair again", this::pair);
         } else if (outOfMemory && paired) {
             remote.set("The Wii Remote connected but the system could not start its driver (memory is too "
                     + "fragmented). Restart this device, then press a button on the remote.", BAD, "Pair again", this::pair);
@@ -228,7 +231,7 @@ public class MainActivity extends Activity {
         } else {
             String want = c == null ? null : "Android/" + c.getControllerNumber() + "/Wii Remote";
             boolean done = want != null && r[4].trim().equals(want);
-            dolphin.set(done ? "Wii Remote 1 uses the bridge. Start a game." : "Not set up yet",
+            dolphin.set(done ? "Wii Remote 1 uses the bridge. Start a game." : "Not set up yet (this closes Dolphin if it is open)",
                     done ? OK : DIM, c == null ? null : (done ? "Set up again" : "Set up"), this::setUpDolphin);
         }
         String[] lines = r[3].split("\n");
@@ -266,6 +269,18 @@ public class MainActivity extends Activity {
             dolphin.status.setText(msg == null ? "Failed" : msg);
             handler.postDelayed(this::refresh, 1500);
         });
+    }
+
+    /** Battery of the raw remote as the Wii Remote driver reports it, or -1. */
+    private int remoteBattery() {
+        android.hardware.input.InputManager im = getSystemService(android.hardware.input.InputManager.class);
+        for (int id : im.getInputDeviceIds()) {
+            InputDevice d = im.getInputDevice(id);
+            if (d == null || !d.getName().equals("Nintendo Wii Remote")) continue;
+            android.hardware.BatteryState b = d.getBatteryState();
+            if (b.isPresent()) return Math.round(b.getCapacity() * 100);
+        }
+        return -1;
     }
 
     private void rumble() {
@@ -334,11 +349,14 @@ public class MainActivity extends Activity {
     private final class TestView extends View {
         private float px, py, ax, ay, az, sx, sy;
         private boolean seen;
+        private long irAt;   // last time the pointer moved, i.e. the camera saw the sensor bar
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         TestView(Context c) { super(c); }
 
         void update(MotionEvent e) {
-            px = e.getAxisValue(MotionEvent.AXIS_RX); py = e.getAxisValue(MotionEvent.AXIS_RY);
+            float nx = e.getAxisValue(MotionEvent.AXIS_RX), ny = e.getAxisValue(MotionEvent.AXIS_RY);
+            if (nx != px || ny != py) irAt = System.currentTimeMillis();
+            px = nx; py = ny;
             ax = e.getAxisValue(MotionEvent.AXIS_Z) * 4; ay = e.getAxisValue(MotionEvent.AXIS_RZ) * 4;
             az = e.getAxisValue(MotionEvent.AXIS_THROTTLE) * 4;
             sx = e.getAxisValue(MotionEvent.AXIS_X); sy = e.getAxisValue(MotionEvent.AXIS_Y);
@@ -351,8 +369,12 @@ public class MainActivity extends Activity {
             p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(2)); p.setColor(0xFF30363D);
             c.drawRect(dp(4), dp(8), screenW, h - dp(8), p);
             p.setStyle(Paint.Style.FILL); p.setColor(DIM); p.setTextSize(dp(12));
-            c.drawText("Pointer", dp(10), dp(26), p);
-            if (seen) {
+            boolean bar = System.currentTimeMillis() - irAt < 1500;
+            p.setColor(bar ? OK : WARN);
+            c.drawText(bar ? "Pointer: sensor bar in view" : "Pointer: no sensor bar in view (place it above or below the screen)",
+                    dp(10), dp(26), p);
+            postInvalidateDelayed(500);
+            if (seen && bar) {
                 float x = dp(4) + (px + 1) / 2 * (screenW - dp(4)), y = dp(8) + (py + 1) / 2 * (h - dp(16));
                 p.setColor(0x551F6FEB); c.drawCircle(x, y, dp(18), p);
                 p.setColor(Color.WHITE); c.drawCircle(x, y, dp(6), p);
