@@ -540,6 +540,10 @@ static void update_pointer(Remote *r) {
                 double dx = tx - aim_x + carry_x, dy = ty - aim_y + carry_y;
                 int ix = (int) dx, iy = (int) dy;
                 carry_x = dx - ix; carry_y = dy - iy;
+                // Android accelerates fast mouse moves, so the cursor drifts from the aim. Aiming past an
+                // edge pushes the cursor into that edge too, which lines the two up again.
+                if (sx <= 0) ix -= 64; else if (sx >= 1) ix += 64;
+                if (sy <= 0) iy -= 64; else if (sy >= 1) iy += 64;
                 if (ix || iy) {
                     pointer_emit(EV_REL, REL_X, ix);
                     pointer_emit(EV_REL, REL_Y, iy);
