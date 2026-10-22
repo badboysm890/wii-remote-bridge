@@ -4,7 +4,7 @@
 and it sets up Dolphin for you, with the pointer, motion, Nunchuk, Classic Controller and rumble for
 up to four players. No root, no USB bar, no mapping screens.
 
-**[Download the APK](../../releases/latest)**
+**[Download the APK](../../releases/latest)** · **[How to use (step by step)](docs/GUIDE.md)** · **[Sensor bar help](docs/GUIDE.md#sensor-bar)**
 
 ![Wii Remote Bridge](docs/app.png)
 
@@ -25,7 +25,11 @@ up to four players. No root, no USB bar, no mapping screens.
 | Remote speaker | ✅ | ❌ Its sounds play on the device instead (sending them to the remote needs root) |
 | Balance Board, guitar, drums | ✅ | ❌ Not yet |
 
-## Setup (about two minutes)
+## Setup (about five minutes)
+
+The short version is below. **[The full guide](docs/GUIDE.md)** walks through Shizuku, pairing, the sensor
+bar and troubleshooting step by step.
+
 
 1. Install **[Shizuku](https://shizuku.rikka.app/)** and start it (Wireless debugging, no root).
    Open Wii Remote Bridge and tap **Allow**.
@@ -33,8 +37,9 @@ up to four players. No root, no USB bar, no mapping screens.
    reconnects. For more players, tap **Pair another**.
 3. **Open Dolphin once**, then come back. The app maps every connected remote to Dolphin's Wii Remote
    1–4 by itself. **Set up again** redoes it whenever you want.
-4. Put the sensor bar above or below the screen. The **Test** panel shows the pointer, motion,
-   buttons and battery, and has a rumble button.
+4. Put a sensor bar above or below the screen, 1.5–3 m from you. No Wii needed: a USB sensor bar
+   works ([options and placement](docs/GUIDE.md#sensor-bar)). The **Test** panel shows the pointer,
+   motion, buttons and battery, and has a rumble button.
 
 After a restart, start Shizuku once. The bridge and Dolphin's settings follow by themselves.
 
