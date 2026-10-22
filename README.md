@@ -82,6 +82,8 @@ rumble back to the right remote. The axis layout is documented in
 
 `native/build.sh` builds the bridge for arm64-v8a and x86_64, then run `./gradlew :app:assembleRelease`.
 
+Note: Yes its vibe coded if you have issues with that don't use it, I dont really care at this point enough with rant and stuff.
+
 ## License
 
 MIT
