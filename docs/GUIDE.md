@@ -14,7 +14,7 @@ need no DolphinBar and no root. Plan on about five minutes the first time.
 
 ## 1. Install the apps
 
-1. Install **Wii Remote Bridge** from the [latest release](../../../releases/latest) (download the `.apk`
+1. Install **Wii Remote Bridge** from the [latest release](https://github.com/badboysm890/wii-remote-bridge/releases/latest) (download the `.apk`
    and open it).
 2. Install **[Shizuku](https://shizuku.rikka.app/download/)** (Play Store or GitHub).
 3. Install **Dolphin**, open it once and add your games, then close it.
