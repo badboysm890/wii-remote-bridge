@@ -26,6 +26,7 @@ final class Pairing {
     private BluetoothDevice target;
     private int attempt;
     private boolean active = true;
+    private boolean rebond;   // the remote was paired before: forget that pairing first, then pair again
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent intent) {
@@ -41,7 +42,12 @@ final class Pairing {
                     target = device;
                     adapter.cancelDiscovery();
                     status.accept("Found " + device.getName() + ", pairing…");
-                    device.createBond();
+                    if (device.getBondState() == BluetoothDevice.BOND_BONDED) {
+                        rebond = true;
+                        try { device.getClass().getMethod("removeBond").invoke(device); } catch (Exception ignored) { }
+                    } else {
+                        device.createBond();
+                    }
                 }
             } else if (BluetoothDevice.ACTION_PAIRING_REQUEST.equals(action)) {
                 if (!device.equals(target)) return;
@@ -59,7 +65,8 @@ final class Pairing {
                     status.accept("Paired. Press any button on the Wii Remote to connect.");
                     stop();
                 } else if (state == BluetoothDevice.BOND_NONE) {
-                    if (attempt == 1) device.createBond();
+                    if (rebond) { rebond = false; device.createBond(); }
+                    else if (attempt == 1) device.createBond();
                     else {
                         status.accept("Pairing failed. Press SYNC again.");
                         target = null;
@@ -86,10 +93,7 @@ final class Pairing {
         f.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
         f.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY - 1);
         context.registerReceiver(receiver, f, Context.RECEIVER_EXPORTED);
-        // A fresh pairing: forget an old one (it may belong to another console or phone).
-        for (BluetoothDevice d : adapter.getBondedDevices()) if (isWiimote(d)) {
-            try { d.getClass().getMethod("removeBond").invoke(d); } catch (Exception ignored) { }
-        }
+        // Remotes paired earlier stay paired: this adds one (players 2 to 4 pair the same way).
         status.accept("Open the Wii Remote's battery cover and press the red SYNC button.");
         adapter.cancelDiscovery();
         adapter.startDiscovery();

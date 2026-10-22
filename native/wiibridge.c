@@ -1,16 +1,19 @@
-// wiibridge: the whole Wii Remote as one Android game controller, without root.
+// wiibridge: real Wii Remotes as Android game controllers, without root. Up to four players.
 //
-// The kernel's hid-wiimote driver splits a remote into several input devices (buttons, IR camera,
+// The kernel's hid-wiimote driver splits each remote into several input devices (buttons, IR camera,
 // accelerometer, Nunchuk). Android only adopts the one with buttons, so apps such as Dolphin never see
 // the pointer or the motion. This program (run as the adb/Shizuku shell user, which may read
-// /dev/input and write /dev/uinput) grabs them all and re-emits them as a single virtual gamepad:
+// /dev/input and write /dev/uinput) groups each remote's parts by its Bluetooth address and re-emits
+// them as one virtual gamepad per remote, "Wii Remote 1" to "Wii Remote 4":
 //
-//   buttons   A=SOUTH B=EAST 1=WEST 2=NORTH  +=START -=SELECT Home=MODE  D-pad=arrow keys (Android drops BTN_DPAD_*)  C=TL Z=TR
+//   buttons   A=SOUTH B=EAST 1=WEST 2=NORTH  +=START -=SELECT Home=MODE  D-pad=arrow keys (Android drops
+//             BTN_DPAD_*)  C=TL Z=TR
 //   ABS_X/Y   Nunchuk stick                     ABS_RX/RY  IR pointer (sensor bar)
-//   ABS_Z/RZ/THROTTLE  remote acceleration x/y/z (+-1 = 4 g)   ABS_RUDDER/WHEEL/GAS  Nunchuk acceleration x/y/z
+//   ABS_Z/RZ/THROTTLE  remote acceleration x/y/z (+-1 = 4 g)   ABS_RUDDER/WHEEL/GAS  Nunchuk acceleration
 //   THUMBL/THUMBR      remote / Nunchuk shake
 //
-// and forwards rumble from Android (InputDevice vibrator, e.g. Dolphin) back to the remote.
+// Rumble from Android (each controller's vibrator, e.g. Dolphin) goes back to the matching remote.
+// A remote keeps its player number for as long as the bridge runs, also across reconnects.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,75 +28,64 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { KEYS, IR, ACCEL, NUNCHUK, NDEV };
-static const char *NAMES[NDEV] = {
+enum { KEYS, IR, ACCEL, NUNCHUK, NPART };
+static const char *PART_NAMES[NPART] = {
     "Nintendo Wii Remote", "Nintendo Wii Remote IR", "Nintendo Wii Remote Accelerometer",
     "Nintendo Wii Remote Nunchuk"};
-static int fds[NDEV] = {-1, -1, -1, -1};
 
+#define MAX_REMOTES 4
 #define AXMAX 32767
-static int u = -1;               // the virtual controller
-static int rumble_id = -1;       // effect uploaded to the real remote
-static int ff_len[16];           // replay length (ms) of effects Android uploaded to us
+#define G 104.0   // raw accelerometer units per g
+
+typedef struct {
+    int used;
+    char addr[32];           // Bluetooth address: the remote's identity across reconnects
+    int fd[NPART];
+    char node[NPART][16];    // eventN each part was opened from
+    int u;                   // its virtual controller
+    int rumble_id;           // effect uploaded to the real remote
+    int ff_len[16];          // replay length (ms) of effects Android uploaded to us
+    int dot[4][2];
+    double sepx, sepy, px, py;
+    int have_sep;
+    int acc[2][3];           // latest raw acceleration: remote, Nunchuk
+    int shaking[2];
+} Remote;
+
+static Remote remotes[MAX_REMOTES];
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
-static void emit(int type, int code, int value) {
+static void emit(Remote *r, int type, int code, int value) {
     struct input_event ev;
     memset(&ev, 0, sizeof ev);
     ev.type = type; ev.code = code; ev.value = value;
-    if (write(u, &ev, sizeof ev) < 0) { /* uinput full: drop */ }
+    if (r->u >= 0 && write(r->u, &ev, sizeof ev) < 0) { /* uinput full: drop */ }
 }
 
 static int clampi(double v) { return v > AXMAX ? AXMAX : v < -AXMAX ? -AXMAX : (int) v; }
 
-static int open_named(const char *want) {
-    DIR *d = opendir("/dev/input");
-    if (!d) return -1;
-    struct dirent *e;
-    int found = -1;
-    while ((e = readdir(d)) && found < 0) {
-        if (strncmp(e->d_name, "event", 5)) continue;
-        char path[64], name[128] = "";
-        snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
-        int fd = open(path, O_RDWR | O_NONBLOCK);
-        if (fd < 0) fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0) continue;
-        ioctl(fd, EVIOCGNAME(sizeof name), name);
-        if (!strcmp(name, want)) found = fd; else close(fd);
-    }
-    closedir(d);
-    return found;
+/** Retroid handhelds replace every new controller with a copy of their own pad (fixed axes, no rumble)
+ *  unless this setting is on while the controller is created. Returns whether it was switched on. */
+static int retroid_cloning_off(void) {
+    FILE *f = popen("settings get system no_create_gamepad_button_layout 2>/dev/null", "r");
+    char v[16] = "";
+    if (f) { if (!fgets(v, sizeof v, f)) v[0] = 0; pclose(f); }
+    if (v[0] != '0') return 0;   // not a Retroid ("null"), or already on
+    return system("settings put system no_create_gamepad_button_layout 1") == 0;
 }
 
-static void rumble_setup(void) {
-    struct ff_effect e;
-    memset(&e, 0, sizeof e);
-    e.type = FF_RUMBLE; e.id = -1; e.u.rumble.strong_magnitude = 0xffff; e.replay.length = 100;
-    rumble_id = ioctl(fds[KEYS], EVIOCSFF, &e) < 0 ? -1 : e.id;
+static void retroid_cloning_back(int was_switched) {
+    if (!was_switched) return;
+    sleep(2);   // Retroid's mapping service reacts to the new device after it appears
+    if (system("settings put system no_create_gamepad_button_layout 0") != 0) { }
 }
 
-/** Turns the real remote's motor on (for ms, 0 = until stopped) or off. */
-static void rumble(int on, int ms) {
-    if (fds[KEYS] < 0 || rumble_id < 0) return;
-    if (on) {
-        struct ff_effect e;
-        memset(&e, 0, sizeof e);
-        e.type = FF_RUMBLE; e.id = rumble_id; e.u.rumble.strong_magnitude = 0xffff;
-        e.replay.length = ms > 0 ? ms : 0xffff;
-        ioctl(fds[KEYS], EVIOCSFF, &e);
-    }
-    struct input_event ev;
-    memset(&ev, 0, sizeof ev);
-    ev.type = EV_FF; ev.code = rumble_id; ev.value = on;
-    if (write(fds[KEYS], &ev, sizeof ev) < 0) { /* remote gone */ }
-}
-
-static void make_controller(void) {
-    // UI_DEV_SETUP/UI_ABS_SETUP, not the legacy uinput_user_dev write: Retroid's kernel rewrites legacy
-    // devices into a copy of its own pad (its vendor id, six axes, no rumble).
-    u = open("/dev/uinput", O_RDWR | O_NONBLOCK);
-    if (u < 0) { perror("uinput"); exit(1); }
+/** The virtual controller for player slot+1. UI_DEV_SETUP, not the legacy uinput_user_dev write:
+ *  Retroid's kernel rewrites legacy devices into a copy of its own pad (its vendor id, six axes, no rumble). */
+static int make_controller(int slot) {
+    int u = open("/dev/uinput", O_RDWR | O_NONBLOCK);
+    if (u < 0) { perror("uinput"); return -1; }
     ioctl(u, UI_SET_EVBIT, EV_KEY);
     int keys[] = {BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_START, BTN_SELECT, BTN_MODE, BTN_TL, BTN_TR,
                   KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, BTN_THUMBL, BTN_THUMBR};
@@ -109,35 +101,70 @@ static void make_controller(void) {
     }
     ioctl(u, UI_SET_EVBIT, EV_FF);
     ioctl(u, UI_SET_FFBIT, FF_RUMBLE);
+    char phys[32];
+    snprintf(phys, sizeof phys, "wiibridge/%d", slot + 1);
+    ioctl(u, UI_SET_PHYS, phys);
     struct uinput_setup st;
     memset(&st, 0, sizeof st);
-    snprintf(st.name, sizeof st.name, "Wii Remote");
-    st.id.bustype = BUS_BLUETOOTH; st.id.vendor = 0x057e; st.id.product = 0x7f02; st.id.version = 1;
+    snprintf(st.name, sizeof st.name, "Wii Remote %d", slot + 1);
+    st.id.bustype = BUS_BLUETOOTH; st.id.vendor = 0x057e; st.id.product = 0x7f02; st.id.version = slot + 1;
     st.ff_effects_max = 16;
-    if (ioctl(u, UI_DEV_SETUP, &st) < 0 || ioctl(u, UI_DEV_CREATE) < 0) { perror("uinput create"); exit(1); }
+    int retroid = retroid_cloning_off();
+    if (ioctl(u, UI_DEV_SETUP, &st) < 0 || ioctl(u, UI_DEV_CREATE) < 0) {
+        perror("uinput create");
+        close(u);
+        retroid_cloning_back(retroid);
+        return -1;
+    }
+    retroid_cloning_back(retroid);
+    fprintf(stderr, "wiibridge: created \"Wii Remote %d\"\n", slot + 1);
+    return u;
 }
 
-/** Android's vibrator talks to our virtual controller; play it on the real remote. */
-static void handle_ff(void) {
+static void rumble_setup(Remote *r) {
+    struct ff_effect e;
+    memset(&e, 0, sizeof e);
+    e.type = FF_RUMBLE; e.id = -1; e.u.rumble.strong_magnitude = 0xffff; e.replay.length = 100;
+    r->rumble_id = ioctl(r->fd[KEYS], EVIOCSFF, &e) < 0 ? -1 : e.id;
+}
+
+/** Turns the real remote's motor on (for ms, 0 = until stopped) or off. */
+static void rumble(Remote *r, int on, int ms) {
+    if (r->fd[KEYS] < 0 || r->rumble_id < 0) return;
+    if (on) {
+        struct ff_effect e;
+        memset(&e, 0, sizeof e);
+        e.type = FF_RUMBLE; e.id = r->rumble_id; e.u.rumble.strong_magnitude = 0xffff;
+        e.replay.length = ms > 0 ? ms : 0xffff;
+        ioctl(r->fd[KEYS], EVIOCSFF, &e);
+    }
     struct input_event ev;
-    while (read(u, &ev, sizeof ev) == sizeof ev) {
+    memset(&ev, 0, sizeof ev);
+    ev.type = EV_FF; ev.code = r->rumble_id; ev.value = on;
+    if (write(r->fd[KEYS], &ev, sizeof ev) < 0) { /* remote gone */ }
+}
+
+/** Android's vibrator talks to the virtual controller; play it on the real remote. */
+static void handle_ff(Remote *r) {
+    struct input_event ev;
+    while (read(r->u, &ev, sizeof ev) == sizeof ev) {
         if (ev.type == EV_UINPUT && ev.code == UI_FF_UPLOAD) {
             struct uinput_ff_upload up;
             memset(&up, 0, sizeof up);
             up.request_id = ev.value;
-            ioctl(u, UI_BEGIN_FF_UPLOAD, &up);
-            if (up.effect.id >= 0 && up.effect.id < 16) ff_len[up.effect.id] = up.effect.replay.length;
+            ioctl(r->u, UI_BEGIN_FF_UPLOAD, &up);
+            if (up.effect.id >= 0 && up.effect.id < 16) r->ff_len[up.effect.id] = up.effect.replay.length;
             up.retval = 0;
-            ioctl(u, UI_END_FF_UPLOAD, &up);
+            ioctl(r->u, UI_END_FF_UPLOAD, &up);
         } else if (ev.type == EV_UINPUT && ev.code == UI_FF_ERASE) {
             struct uinput_ff_erase er;
             memset(&er, 0, sizeof er);
             er.request_id = ev.value;
-            ioctl(u, UI_BEGIN_FF_ERASE, &er);
+            ioctl(r->u, UI_BEGIN_FF_ERASE, &er);
             er.retval = 0;
-            ioctl(u, UI_END_FF_ERASE, &er);
+            ioctl(r->u, UI_END_FF_ERASE, &er);
         } else if (ev.type == EV_FF && ev.code < 16) {
-            rumble(ev.value > 0, ev.value > 0 ? ff_len[ev.code] : 0);
+            rumble(r, ev.value > 0, ev.value > 0 ? r->ff_len[ev.code] : 0);
         }
     }
 }
@@ -161,31 +188,158 @@ static int map_key(int code) {
     }
 }
 
-#define G 104.0
-static int acc[2][3];          // latest raw acceleration: remote, Nunchuk
-static int shaking[2];
-
 /** A shake (remote or Nunchuk) is a button: down past 2.2 g, up again below 1.4 g. */
-static void shake(int which) {
-    double m = sqrt((double) acc[which][0] * acc[which][0] + (double) acc[which][1] * acc[which][1] +
-                    (double) acc[which][2] * acc[which][2]) / G;
-    int now_on = shaking[which] ? m > 1.4 : m > 2.2;
-    if (now_on != shaking[which]) { shaking[which] = now_on; emit(EV_KEY, which ? BTN_THUMBR : BTN_THUMBL, now_on); }
+static void shake(Remote *r, int which) {
+    double m = sqrt((double) r->acc[which][0] * r->acc[which][0] + (double) r->acc[which][1] * r->acc[which][1] +
+                    (double) r->acc[which][2] * r->acc[which][2]) / G;
+    int on = r->shaking[which] ? m > 1.4 : m > 2.2;
+    if (on != r->shaking[which]) { r->shaking[which] = on; emit(r, EV_KEY, which ? BTN_THUMBR : BTN_THUMBL, on); }
 }
 
-/** The remote (or its Nunchuk) went away: let go of everything it was holding, so nothing sticks. */
-static void release(int part) {
+/** A part went away: let go of everything it was holding, so nothing sticks. */
+static void release(Remote *r, int part) {
     static const int remote_keys[] = {BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_START, BTN_SELECT, BTN_MODE,
                                       KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, BTN_THUMBL};
     static const int nunchuk_keys[] = {BTN_TL, BTN_TR, BTN_THUMBR};
     if (part == KEYS)
-        for (unsigned i = 0; i < sizeof remote_keys / sizeof *remote_keys; i++) emit(EV_KEY, remote_keys[i], 0);
+        for (unsigned i = 0; i < sizeof remote_keys / sizeof *remote_keys; i++) emit(r, EV_KEY, remote_keys[i], 0);
     if (part == NUNCHUK) {
-        for (unsigned i = 0; i < sizeof nunchuk_keys / sizeof *nunchuk_keys; i++) emit(EV_KEY, nunchuk_keys[i], 0);
-        emit(EV_ABS, ABS_X, 0);
-        emit(EV_ABS, ABS_Y, 0);
+        for (unsigned i = 0; i < sizeof nunchuk_keys / sizeof *nunchuk_keys; i++) emit(r, EV_KEY, nunchuk_keys[i], 0);
+        emit(r, EV_ABS, ABS_X, 0);
+        emit(r, EV_ABS, ABS_Y, 0);
     }
-    emit(EV_SYN, SYN_REPORT, 0);
+    emit(r, EV_SYN, SYN_REPORT, 0);
+}
+
+/** The Bluetooth address of the remote an event node belongs to (its HID parent's HID_UNIQ). */
+static int remote_address(const char *node, char *out, size_t len) {
+    char path[128];
+    snprintf(path, sizeof path, "/sys/class/input/%s/device/device/uevent", node);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[160];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "HID_UNIQ=", 9)) {
+            line[strcspn(line, "\n")] = 0;
+            snprintf(out, len, "%s", line + 9);
+            found = out[0] != 0;
+        }
+    }
+    fclose(f);
+    if (!found) {   // no address: group by the HID device itself
+        snprintf(path, sizeof path, "/sys/class/input/%s/device/device", node);
+        char real[160];
+        if (realpath(path, real)) { snprintf(out, len, "%s", real); found = 1; }
+    }
+    return found;
+}
+
+static Remote *remote_for(const char *addr) {
+    for (int i = 0; i < MAX_REMOTES; i++) if (remotes[i].used && !strcmp(remotes[i].addr, addr)) return &remotes[i];
+    for (int i = 0; i < MAX_REMOTES; i++) if (!remotes[i].used) {
+        Remote *r = &remotes[i];
+        memset(r, 0, sizeof *r);
+        r->used = 1;
+        snprintf(r->addr, sizeof r->addr, "%s", addr);
+        for (int p = 0; p < NPART; p++) r->fd[p] = -1;
+        for (int d = 0; d < 4; d++) r->dot[d][0] = r->dot[d][1] = 1023;
+        r->rumble_id = -1;
+        r->u = make_controller(i);
+        return r;
+    }
+    return NULL;   // more than four remotes
+}
+
+static int part_open(const char *node) {
+    for (int i = 0; i < MAX_REMOTES; i++)
+        for (int p = 0; p < NPART; p++)
+            if (remotes[i].used && remotes[i].fd[p] >= 0 && !strcmp(remotes[i].node[p], node)) return 1;
+    return 0;
+}
+
+/** Finds remotes and parts that appeared since the last look (a remote may connect any time, or gain a Nunchuk). */
+static void scan(void) {
+    DIR *d = opendir("/dev/input");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "event", 5) || part_open(e->d_name)) continue;
+        char path[64], name[128] = "";
+        snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
+        int fd = open(path, O_RDWR | O_NONBLOCK);
+        if (fd < 0) fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        ioctl(fd, EVIOCGNAME(sizeof name), name);
+        int part = -1;
+        for (int p = 0; p < NPART; p++) if (!strcmp(name, PART_NAMES[p])) part = p;
+        char addr[160];
+        Remote *r = part >= 0 && remote_address(e->d_name, addr, sizeof addr) ? remote_for(addr) : NULL;
+        if (!r || r->fd[part] >= 0) { close(fd); continue; }
+        r->fd[part] = fd;
+        snprintf(r->node[part], sizeof r->node[part], "%s", e->d_name);
+        fprintf(stderr, "wiibridge: player %d (%s): %s connected\n", (int) (r - remotes) + 1, r->addr, name);
+        if (part == KEYS) {
+            // Keep Android from also seeing the raw remote (it would be a second, button-only pad).
+            ioctl(fd, EVIOCGRAB, 1);
+            rumble_setup(r);
+            rumble(r, 1, 120);   // a short buzz: "you are connected"
+        }
+    }
+    closedir(d);
+}
+
+static void read_part(Remote *r, int part, int *ir_moved, int *synced) {
+    struct input_event ev;
+    while (read(r->fd[part], &ev, sizeof ev) == sizeof ev) {
+        if (ev.type == EV_SYN) { *synced = 1; if (part == IR) *ir_moved = 1; continue; }
+        if (ev.type == EV_KEY && ev.value != 2) {
+            int k = map_key(ev.code);
+            if (k >= 0) emit(r, EV_KEY, k, ev.value);
+        } else if (ev.type == EV_ABS && part == IR && ev.code >= ABS_HAT0X && ev.code <= ABS_HAT3Y) {
+            int k = ev.code - ABS_HAT0X;
+            r->dot[k / 2][k % 2] = ev.value;
+        } else if (ev.type == EV_ABS && part == ACCEL) {
+            int k = ev.code - ABS_RX;
+            if (k < 0 || k > 2) continue;
+            r->acc[0][k] = ev.value;
+            int code = k == 0 ? ABS_Z : k == 1 ? ABS_RZ : ABS_THROTTLE;
+            emit(r, EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
+            shake(r, 0);
+        } else if (ev.type == EV_ABS && part == NUNCHUK) {
+            if (ev.code == ABS_HAT0X) emit(r, EV_ABS, ABS_X, clampi(ev.value * (AXMAX / 100.0)));
+            else if (ev.code == ABS_HAT0Y) emit(r, EV_ABS, ABS_Y, clampi(-ev.value * (AXMAX / 100.0)));
+            else if (ev.code >= ABS_RX && ev.code <= ABS_RZ) {
+                int k = ev.code - ABS_RX;
+                r->acc[1][k] = ev.value;
+                int code = k == 0 ? ABS_RUDDER : k == 1 ? ABS_WHEEL : ABS_GAS;
+                emit(r, EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
+                shake(r, 1);
+            }
+        }
+    }
+}
+
+/** The pointer is the middle of the sensor bar's two dots; with one in view, assume the pair kept its
+ *  spacing. The camera sees the room mirrored, so x is flipped. */
+static void update_pointer(Remote *r) {
+    int idx[4], n = 0;
+    for (int i = 0; i < 4; i++) if (r->dot[i][0] < 1023 && r->dot[i][1] < 1023) idx[n++] = i;
+    double cx = -1, cy = -1;
+    if (n >= 2) {
+        cx = (r->dot[idx[0]][0] + r->dot[idx[1]][0]) / 2.0;
+        cy = (r->dot[idx[0]][1] + r->dot[idx[1]][1]) / 2.0;
+        r->sepx = cx - r->dot[idx[0]][0]; r->sepy = cy - r->dot[idx[0]][1]; r->have_sep = 1;
+    } else if (n == 1 && r->have_sep) {
+        double ax = r->dot[idx[0]][0] + r->sepx, bx = r->dot[idx[0]][0] - r->sepx;
+        cx = (ax - 512) * (ax - 512) < (bx - 512) * (bx - 512) ? ax : bx;
+        cy = r->dot[idx[0]][1] + (cx == ax ? r->sepy : -r->sepy);
+    }
+    if (cx < 0) return;
+    double x = 1 - cx / 1023.0 * 2, y = cy / 767.0 * 2 - 1;   // -1..1, right/down positive
+    r->px += (x - r->px) * 0.5; r->py += (y - r->py) * 0.5;
+    emit(r, EV_ABS, ABS_RX, clampi(r->px * AXMAX));
+    emit(r, EV_ABS, ABS_RY, clampi(r->py * AXMAX));
 }
 
 static volatile int running = 1;
@@ -194,89 +348,50 @@ static void quit(int s) { (void) s; running = 0; }
 int main(void) {
     signal(SIGTERM, quit); signal(SIGINT, quit); signal(SIGHUP, SIG_IGN);
     setvbuf(stderr, NULL, _IOLBF, 0);
-    make_controller();
-    int dot[4][2];
-    for (int i = 0; i < 4; i++) dot[i][0] = dot[i][1] = 1023;
-    double lastScan = 0, sepx = 0, sepy = 0, px = 0, py = 0;
-    int haveSep = 0;
+    double last_scan = -10;
     while (running) {
-        // (Re)find the remote's parts: it may connect later, drop out, or gain a Nunchuk.
-        if (now() - lastScan > 2) {
-            lastScan = now();
-            for (int i = 0; i < NDEV; i++) if (fds[i] < 0 && (fds[i] = open_named(NAMES[i])) >= 0) {
-                fprintf(stderr, "wiibridge: %s connected\n", NAMES[i]);
-                // Keep Android from also seeing the raw remote (it would be a second, button-only pad).
-                if (i == KEYS) { ioctl(fds[i], EVIOCGRAB, 1); rumble_setup(); rumble(1, 120); }
+        if (now() - last_scan > 2) { last_scan = now(); scan(); }
+        struct pollfd p[MAX_REMOTES * (NPART + 1)];
+        Remote *owner[MAX_REMOTES * (NPART + 1)];
+        int part_of[MAX_REMOTES * (NPART + 1)];
+        int n = 0;
+        for (int i = 0; i < MAX_REMOTES; i++) {
+            Remote *r = &remotes[i];
+            if (!r->used) continue;
+            for (int k = 0; k <= NPART; k++) {
+                int fd = k < NPART ? r->fd[k] : r->u;
+                if (fd < 0) continue;
+                p[n].fd = fd; p[n].events = POLLIN; p[n].revents = 0;
+                owner[n] = r; part_of[n] = k; n++;
             }
         }
-        struct pollfd p[NDEV + 1];
-        for (int i = 0; i < NDEV; i++) { p[i].fd = fds[i]; p[i].events = POLLIN; p[i].revents = 0; }
-        p[NDEV].fd = u; p[NDEV].events = POLLIN; p[NDEV].revents = 0;
-        if (poll(p, NDEV + 1, 500) < 0 && errno != EINTR) break;
-        if (p[NDEV].revents & POLLIN) handle_ff();
-        int irMoved = 0, synced = 0;
-        for (int i = 0; i < NDEV; i++) {
-            if (fds[i] < 0) continue;
-            if (p[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                fprintf(stderr, "wiibridge: %s gone\n", NAMES[i]);
-                close(fds[i]); fds[i] = -1;
-                release(i);
-                if (i == KEYS) rumble_id = -1;
-                continue;
-            }
-            struct input_event ev;
-            while (read(fds[i], &ev, sizeof ev) == sizeof ev) {
-                if (ev.type == EV_SYN) { synced = 1; if (i == IR) irMoved = 1; continue; }
-                if (ev.type == EV_KEY && ev.value != 2) {
-                    int k = map_key(ev.code);
-                    if (k >= 0) emit(EV_KEY, k, ev.value);
-                } else if (ev.type == EV_ABS && i == IR && ev.code >= ABS_HAT0X && ev.code <= ABS_HAT3Y) {
-                    int k = ev.code - ABS_HAT0X;
-                    dot[k / 2][k % 2] = ev.value;
-                } else if (ev.type == EV_ABS && i == ACCEL) {
-                    // Raw acceleration for Dolphin's Accelerometer input: axis +-1 = +-4 g (about 104 raw per g).
-                    int k = ev.code - ABS_RX;
-                    if (k >= 0 && k < 3) acc[0][k] = ev.value;
-                    int code = ev.code == ABS_RX ? ABS_Z : ev.code == ABS_RY ? ABS_RZ : ABS_THROTTLE;
-                    emit(EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
-                    shake(0);
-                } else if (ev.type == EV_ABS && i == NUNCHUK) {
-                    if (ev.code == ABS_HAT0X) emit(EV_ABS, ABS_X, clampi(ev.value * (AXMAX / 100.0)));
-                    else if (ev.code == ABS_HAT0Y) emit(EV_ABS, ABS_Y, clampi(-ev.value * (AXMAX / 100.0)));
-                    else if (ev.code >= ABS_RX && ev.code <= ABS_RZ) {
-                        acc[1][ev.code - ABS_RX] = ev.value;
-                        int code = ev.code == ABS_RX ? ABS_RUDDER : ev.code == ABS_RY ? ABS_WHEEL : ABS_GAS;
-                        emit(EV_ABS, code, clampi(ev.value * (AXMAX / (4 * G))));
-                        shake(1);
-                    }
+        if (poll(p, n, 500) < 0 && errno != EINTR) break;
+        for (int i = 0; i < MAX_REMOTES; i++) {
+            Remote *r = &remotes[i];
+            if (!r->used) continue;
+            int ir_moved = 0, synced = 0;
+            for (int j = 0; j < n; j++) {
+                if (owner[j] != r || !p[j].revents) continue;
+                int k = part_of[j];
+                if (k == NPART) { handle_ff(r); continue; }
+                if (p[j].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    fprintf(stderr, "wiibridge: player %d: %s gone\n", i + 1, PART_NAMES[k]);
+                    close(r->fd[k]); r->fd[k] = -1; r->node[k][0] = 0;
+                    if (k == KEYS) r->rumble_id = -1;
+                    release(r, k);
+                    continue;
                 }
+                read_part(r, k, &ir_moved, &synced);
             }
+            if (ir_moved) update_pointer(r);
+            if (synced) emit(r, EV_SYN, SYN_REPORT, 0);
         }
-        if (irMoved) {
-            // The pointer is the middle of the sensor bar's two dots; with one in view, assume the pair
-            // kept its spacing. The camera sees the room mirrored, so x is flipped.
-            int idx[4], n = 0;
-            for (int i = 0; i < 4; i++) if (dot[i][0] < 1023 && dot[i][1] < 1023) idx[n++] = i;
-            double cx = -1, cy = -1;
-            if (n >= 2) {
-                cx = (dot[idx[0]][0] + dot[idx[1]][0]) / 2.0;
-                cy = (dot[idx[0]][1] + dot[idx[1]][1]) / 2.0;
-                sepx = cx - dot[idx[0]][0]; sepy = cy - dot[idx[0]][1]; haveSep = 1;
-            } else if (n == 1 && haveSep) {
-                double ax = dot[idx[0]][0] + sepx, bx = dot[idx[0]][0] - sepx;
-                cx = (ax - 512) * (ax - 512) < (bx - 512) * (bx - 512) ? ax : bx;
-                cy = dot[idx[0]][1] + (cx == ax ? sepy : -sepy);
-            }
-            if (cx >= 0) {
-                double x = 1 - cx / 1023.0 * 2, y = cy / 767.0 * 2 - 1;   // -1..1, right/down positive
-                px += (x - px) * 0.5; py += (y - py) * 0.5;
-                emit(EV_ABS, ABS_RX, clampi(px * AXMAX));
-                emit(EV_ABS, ABS_RY, clampi(py * AXMAX));
-            }
-        }
-        if (synced) emit(EV_SYN, SYN_REPORT, 0);
     }
-    if (fds[KEYS] >= 0) ioctl(fds[KEYS], EVIOCGRAB, 0);
-    ioctl(u, UI_DEV_DESTROY);
+    for (int i = 0; i < MAX_REMOTES; i++) {
+        Remote *r = &remotes[i];
+        if (!r->used) continue;
+        if (r->fd[KEYS] >= 0) ioctl(r->fd[KEYS], EVIOCGRAB, 0);
+        if (r->u >= 0) ioctl(r->u, UI_DEV_DESTROY);
+    }
     return 0;
 }

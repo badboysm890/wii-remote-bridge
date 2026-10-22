@@ -15,15 +15,31 @@ final class Dolphin {
     static final int VENDOR = 0x057e, PRODUCT = 0x7f02;
     static final String NAME = "Wii Remote";
 
-    /** The bridge's controller as Android sees it, or null. */
-    static InputDevice controller(Context c) {
+    /** The bridge's controllers ("Wii Remote 1" to "Wii Remote 4") as Android sees them, in player order. */
+    static java.util.List<InputDevice> controllers(Context c) {
         InputManager im = c.getSystemService(InputManager.class);
+        java.util.List<InputDevice> list = new java.util.ArrayList<>();
         for (int id : im.getInputDeviceIds()) {
             InputDevice d = im.getInputDevice(id);
-            if (d != null && d.getVendorId() == VENDOR && d.getProductId() == PRODUCT) return d;
+            if (d != null && d.getVendorId() == VENDOR && d.getProductId() == PRODUCT) list.add(d);
         }
-        return null;
+        list.sort(java.util.Comparator.comparing(InputDevice::getName));
+        return list;
     }
+
+    /** Player 1's controller, or null. */
+    static InputDevice controller(Context c) {
+        java.util.List<InputDevice> l = controllers(c);
+        return l.isEmpty() ? null : l.get(0);
+    }
+
+    static int player(InputDevice d) {
+        String n = d.getName();
+        return n.matches(NAME + " [1-4]") ? n.charAt(n.length() - 1) - '0' : 1;
+    }
+
+    /** Dolphin names Android devices by controller number: "Android/<n>/<name>". */
+    static String qualifier(InputDevice d) { return "Android/" + d.getControllerNumber() + "/" + d.getName(); }
 
     /** Installed Dolphin builds (official, plus forks that keep the org.dolphinemu prefix). */
     static String[] packages(IShell s) throws Exception {
@@ -35,10 +51,8 @@ final class Dolphin {
 
     /** Writes the mapping into every installed Dolphin. Returns a line per Dolphin describing what happened. */
     static String setUp(Context c, IShell s, boolean nunchuk) throws Exception {
-        InputDevice d = controller(c);
-        if (d == null) return "Start the bridge first: Dolphin needs the controller's number.";
-        // Dolphin names Android devices by controller number: "Android/<n>/<name>".
-        String device = "Android/" + d.getControllerNumber() + "/" + NAME;
+        java.util.List<InputDevice> pads = controllers(c);
+        if (pads.isEmpty()) return "Start the bridge first: Dolphin needs the controllers' numbers.";
         StringBuilder report = new StringBuilder();
         String[] pkgs = packages(s);
         if (pkgs.length == 0) return "Dolphin is not installed.";
@@ -50,24 +64,19 @@ final class Dolphin {
             }
             s.run("am force-stop " + pkg);   // Dolphin rewrites its config when it exits
             String ini = s.run("cat " + dir + "/WiimoteNew.ini 2>/dev/null");
-            String updated = withWiimote1(ini.startsWith("error") ? "" : ini, section(device, nunchuk));
+            String updated = ini.startsWith("error") ? "" : ini;
+            for (InputDevice d : pads) updated = withWiimote(updated, player(d), section(player(d), qualifier(d), nunchuk));
             write(s, dir + "/WiimoteNew.ini", updated);
-            report.append(pkg).append(": Wii Remote 1 → ").append(device).append('\n');
+            report.append(pkg).append(": ").append(pads.size() == 1 ? "Wii Remote 1 is set up" : pads.size() + " Wii Remotes are set up").append('\n');
         }
         return report.toString().trim();
     }
 
     /** After the controller number changes (reboot, other pads), keep Dolphin pointing at it. */
     static void refreshDevice(Context c, IShell s) throws Exception {
-        InputDevice d = controller(c);
-        if (d == null) return;
-        String device = "Android/" + d.getControllerNumber() + "/" + NAME;
-        for (String pkg : packages(s)) {
-            String f = configDir(pkg) + "/WiimoteNew.ini";
-            String ini = s.run("cat " + f + " 2>/dev/null");
-            int a = ini.indexOf("[Wiimote1]");
-            if (a < 0 || !ini.contains("/" + NAME + "\n")) continue;   // not set up by us
-            s.run("sed -i '/^\\[Wiimote1\\]/,/^\\[Wiimote2\\]/s#^Device = .*/" + NAME + "$#Device = " + device + "#' " + f);
+        for (InputDevice d : controllers(c)) {
+            s.run("for f in /sdcard/Android/data/org.dolphinemu*/files/Config/WiimoteNew.ini; do [ -f \"$f\" ] && "
+                    + "sed -i 's#^Device = Android/[0-9]*/" + d.getName() + "$#Device = " + qualifier(d) + "#' \"$f\"; done");
         }
     }
 
@@ -76,10 +85,11 @@ final class Dolphin {
         s.run("echo '" + b64 + "' | base64 -d > '" + path + ".tmp' && mv '" + path + ".tmp' '" + path + "'");
     }
 
-    /** Replaces (or adds) the [Wiimote1] section, keeping the other remotes untouched. */
-    static String withWiimote1(String ini, String section) {
-        int a = ini.indexOf("[Wiimote1]");
-        if (a < 0) return section + ini;
+    /** Replaces (or adds) the [WiimoteN] section, keeping the others untouched. */
+    static String withWiimote(String ini, int n, String section) {
+        String head = "[Wiimote" + n + "]";
+        int a = ini.indexOf(head);
+        if (a < 0) return ini.isEmpty() || ini.endsWith("\n") ? ini + section : ini + "\n" + section;
         int b = ini.indexOf("\n[", a + 1);
         return ini.substring(0, a) + section + (b < 0 ? "" : ini.substring(b + 1));
     }
@@ -87,10 +97,10 @@ final class Dolphin {
     // Axis numbers are Android's MotionEvent axes: X 0, Y 1, Z 11, RX 12, RY 13, RZ 14, THROTTLE 19,
     // RUDDER 20, WHEEL 21, GAS 22. Acceleration axes carry +-4 g; Dolphin's accelerometer input wants
     // m/s^2 (it rests at 9.8), so each is scaled by 4 g = 39.2266 m/s^2. Its y is Backward - Forward.
-    static String section(String device, boolean nunchuk) {
+    static String section(int n, String device, boolean nunchuk) {
         String acc = "`Axis %d%s` * 39.2266";
         StringBuilder s = new StringBuilder();
-        s.append("[Wiimote1]\n")
+        s.append("[Wiimote").append(n).append("]\n")
          .append("Device = ").append(device).append('\n')
          .append("Source = 1\n")
          .append("Extension = ").append(nunchuk ? "Nunchuk" : "None").append('\n')

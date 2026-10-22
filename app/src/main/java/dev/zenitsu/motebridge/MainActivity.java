@@ -190,7 +190,7 @@ public class MainActivity extends Activity {
             r[2] = String.join(" ", Dolphin.packages(sh));
             r[3] = sh.bridgeLog();
             r[4] = r[2].isEmpty() ? "" : sh.run("grep -A1 '^\\[Wiimote1\\]' " + Dolphin.configDir(r[2].split(" ")[0])
-                    + "/WiimoteNew.ini 2>/dev/null | grep -o 'Android/[0-9]*/Wii Remote'");
+                    + "/WiimoteNew.ini 2>/dev/null | grep -o 'Android/[0-9]*/Wii Remote[ 0-9]*'");
             return r;
         }, r -> { if (r != null) show(paired, r); });
     }
@@ -207,7 +207,7 @@ public class MainActivity extends Activity {
             int battery = remoteBattery();
             remote.set(battery < 0 ? "Connected" : "Connected · battery " + battery + "%"
                     + (battery <= 15 ? " (low: replace the batteries)" : ""), battery >= 0 && battery <= 15 ? WARN : OK,
-                    "Pair again", this::pair);
+                    "Pair another", this::pair);
         } else if (outOfMemory && paired) {
             remote.set("The Wii Remote connected but the system could not start its driver (memory is too "
                     + "fragmented). Restart this device, then press a button on the remote.", BAD, "Pair again", this::pair);
@@ -217,9 +217,10 @@ public class MainActivity extends Activity {
             remote.set("Not paired yet", DIM, "Pair", this::pair);
         }
         InputDevice c = Dolphin.controller(this);
+        java.util.List<InputDevice> pads = Dolphin.controllers(this);
         if (running && c != null) {
-            bridge.set("Running: Android sees it as \"" + c.getName() + "\" (controller " + c.getControllerNumber()
-                    + ")", OK, "Restart", this::startBridge);
+            bridge.set(pads.size() == 1 ? "Running: player 1 is \"" + c.getName() + "\""
+                    : "Running: " + pads.size() + " players (" + names(pads) + ")", OK, "Restart", this::startBridge);
         } else if (running) {
             bridge.set("Running, waiting for the Wii Remote", WARN, "Restart", this::startBridge);
         } else {
@@ -229,7 +230,7 @@ public class MainActivity extends Activity {
             dolphin.set("Dolphin is not installed.", DIM, "Get Dolphin", () -> open(
                     "https://play.google.com/store/apps/details?id=org.dolphinemu.dolphinemu"));
         } else {
-            String want = c == null ? null : "Android/" + c.getControllerNumber() + "/Wii Remote";
+            String want = c == null ? null : Dolphin.qualifier(c);
             boolean done = want != null && r[4].trim().equals(want);
             dolphin.set(done ? "Wii Remote 1 uses the bridge. Start a game." : "Not set up yet (this closes Dolphin if it is open)",
                     done ? OK : DIM, c == null ? null : (done ? "Set up again" : "Set up"), this::setUpDolphin);
@@ -271,23 +272,34 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** Battery of the raw remote as the Wii Remote driver reports it, or -1. */
+    /** Lowest battery among connected remotes, as the Wii Remote driver reports it, or -1. */
     private int remoteBattery() {
         android.hardware.input.InputManager im = getSystemService(android.hardware.input.InputManager.class);
+        int lowest = -1;
         for (int id : im.getInputDeviceIds()) {
             InputDevice d = im.getInputDevice(id);
             if (d == null || !d.getName().equals("Nintendo Wii Remote")) continue;
             android.hardware.BatteryState b = d.getBatteryState();
-            if (b.isPresent()) return Math.round(b.getCapacity() * 100);
+            if (!b.isPresent()) continue;
+            int v = Math.round(b.getCapacity() * 100);
+            lowest = lowest < 0 ? v : Math.min(lowest, v);
         }
-        return -1;
+        return lowest;
     }
 
+    /** Buzzes every remote, one after another, so each player can tell which one is theirs. */
     private void rumble() {
-        InputDevice c = Dolphin.controller(this);
-        if (c == null) return;
-        Vibrator v = c.getVibratorManager().getDefaultVibrator();
-        v.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE));
+        java.util.List<InputDevice> pads = Dolphin.controllers(this);
+        for (int i = 0; i < pads.size(); i++) {
+            Vibrator v = pads.get(i).getVibratorManager().getDefaultVibrator();
+            handler.postDelayed(() -> v.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE)), i * 600L);
+        }
+    }
+
+    private static String names(java.util.List<InputDevice> pads) {
+        StringBuilder b = new StringBuilder();
+        for (InputDevice d : pads) b.append(b.length() == 0 ? "" : ", ").append(d.getName());
+        return b.toString();
     }
 
     private void openShizuku() {
@@ -313,6 +325,8 @@ public class MainActivity extends Activity {
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
         if (!fromRemote(e.getDevice())) return super.dispatchKeyEvent(e);
         String name = label(e.getKeyCode());
+        int pl = Dolphin.player(e.getDevice());
+        if (Dolphin.controllers(this).size() > 1) name = "P" + pl + ":" + name;
         if (e.getAction() == KeyEvent.ACTION_DOWN) held.add(name); else held.remove(name);
         pressed.setText("Buttons: " + (held.isEmpty() ? "none" : String.join(" ", held)));
         return true;   // the test eats the remote's buttons (B would otherwise mean Back)

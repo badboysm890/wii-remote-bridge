@@ -68,10 +68,8 @@ public class ShellService extends IShell.Stub {
         exec("for p in $(pidof motebridge-wiibridge wiibridge); do kill $p; done");
         // Executables in the app's install directory are not runnable by the shell user; run a copy.
         exec("cp '" + executable + "' " + COPY + " && chmod 755 " + COPY);
-        // Retroid handhelds replace every new controller with a copy of their own pad (fixed axes, no
-        // rumble) unless this setting is on while the controller is created.
-        boolean retroid = !exec("settings get system " + RETROID).trim().equals("null");
-        if (retroid) exec("settings put system " + RETROID + " 1");
+        // A leftover from an interrupted start would leave a Retroid's own pad unmapped.
+        if (exec("settings get system " + RETROID).trim().equals("1")) exec("settings put system " + RETROID + " 0");
         try {
             bridge = new ProcessBuilder(COPY).redirectErrorStream(true).start();
             final Process p = bridge;
@@ -87,8 +85,6 @@ public class ShellService extends IShell.Stub {
         } catch (Exception e) {
             append("start failed: " + e);
             bridge = null;
-        } finally {
-            if (retroid) exec("settings put system " + RETROID + " 0");
         }
         syncDolphin();
         return bridgeRunning();
@@ -99,13 +95,19 @@ public class ShellService extends IShell.Stub {
      * restarts; point every Dolphin that we set up (its Wii Remote 1 uses ".../Wii Remote") at the new one.
      */
     private void syncDolphin() {
-        String n = exec("dumpsys input | awk '/^  Device -?[0-9]+: Wii Remote$/{p=1} "
-                + "p&&/ControllerNum:/{print $2; exit}'").trim();
-        if (!n.matches("\\d+")) return;
-        exec("for f in /sdcard/Android/data/org.dolphinemu*/files/Config/WiimoteNew.ini; do [ -f \"$f\" ] && "
-                + "sed -i '/^\\[Wiimote1\\]/,/^\\[Wiimote2\\]/s#^Device = Android/[0-9]*/Wii Remote$#Device = Android/"
-                + n + "/Wii Remote#' \"$f\"; done");
-        append("Dolphin uses Android/" + n + "/Wii Remote");
+        String input = exec("dumpsys input");
+        for (int player = 1; player <= 4; player++) {
+            String name = "Wii Remote " + player;
+            // The Input Reader section: "  Device 23: Wii Remote 1" followed by "ControllerNum: 2".
+            java.util.regex.Matcher d = java.util.regex.Pattern.compile("\n  Device -?\\d+: " + name + "\n").matcher(input);
+            if (!d.find()) continue;
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("ControllerNum: (\\d+)").matcher(input);
+            if (!m.find(d.end())) continue;
+            String n = m.group(1);
+            exec("for f in /sdcard/Android/data/org.dolphinemu*/files/Config/WiimoteNew.ini; do [ -f \"$f\" ] && "
+                    + "sed -i 's#^Device = Android/[0-9]*/" + name + "$#Device = Android/" + n + "/" + name + "#' \"$f\"; done");
+            append("Dolphin player " + player + " uses Android/" + n + "/" + name);
+        }
     }
 
     private synchronized void append(String line) {
